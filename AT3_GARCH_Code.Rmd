@@ -1,0 +1,506 @@
+---
+title: "AT3"
+author: "Huanwei Xu 14090118"
+date: '2022-11-12'
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+```{r}
+# list of required packages
+required_pkgs <- c('tidyverse'      , 'ggtext'    , 'rugarch', 
+                   'BatchGetSymbols', 'GetBCBData', 'cowplot', 
+                   'purrr'          , 'tidyr'     , 'FinTS'  , 
+                   'scales'         , 'texreg'    , 'knitr'  , 
+                   'kableExtra'     , 'forecast'  , 'writexl','quantmod')
+
+# finds installed pkgs from R session
+installed_pkgs <- installed.packages()
+
+# find missing packages
+missing_pkgs <- required_pkgs[!(required_pkgs %in% installed_pkgs[, 1])]
+
+if (length(missing_pkgs) == 0 ) {
+  message("No missing dependencies")
+} else {
+  install.packages(missing_pkgs)
+  
+  message("All packages installed")
+  
+}
+
+lapply(required_pkgs,library,character.only=TRUE)
+
+Sys.setenv(LANG = "en")
+Sys.setlocale("LC_TIME", "en_US")
+```
+# Setting
+```{r}
+
+
+
+first_date <- '2000-01-01'  
+last_date <- '2022-05-30'
+my_ticker <- 'GOOG' 
+series_name <- 'Google'
+l_out <- BatchGetSymbols(tickers = my_ticker, 
+                         first.date = first_date, 
+                         last.date = last_date)
+
+
+df_prices <- l_out$df.tickers %>%
+  dplyr::select(ref.date, ticker, price.adjusted) %>%
+  dplyr::mutate(log_ret = log(price.adjusted/dplyr::lag(price.adjusted) ),
+         arim_ret = price.adjusted/dplyr::lag(price.adjusted) - 1,
+         series_name = series_name) %>%
+  na.omit()
+
+
+```
+
+# EDA
+```{r}
+
+
+df_inflation <- gbcbd_get_series(id = 433, first.date = min(df_prices$ref.date), 
+                                 last.date = max(df_prices$ref.date)) %>%
+  mutate(inf_index  = cumprod(1+value/100)) # ingest the inflation data 
+
+total_goog_ret <- xts::last(df_prices$price.adjusted)/xts::first(df_prices$price.adjusted)-1 #the total return during selection date
+
+total_inflation <- xts::last(df_inflation$inf_index)/xts::first(df_inflation$inf_index) - 1 #the total inflation during selection date
+
+n_years <- as.numeric(max(df_prices$ref.date) - min(df_prices$ref.date))/365
+
+ret_goog_year = (1+total_goog_ret)^(1/n_years) - 1 # return of Google per year without inflation adujusted
+ret_inflation_year = (1+total_inflation)^(1/n_years) - 1 #inflation per year
+
+real_ret_goog <- (1+total_goog_ret)/(1+total_inflation) - 1 #the real return of Google during selection date
+real_ret_goog_year <- (1+ret_goog_year)/(1+ret_inflation_year) - 1
+#the real return of Google per year
+
+
+p1 <- ggplot(df_prices, aes(x = ref.date, y = price.adjusted)) + 
+  geom_line() + 
+  labs(title = paste0('Prices of ', series_name),
+       subtitle = paste0('Total nominal arithmetic return equals to ', 
+                         round(total_goog_ret*100,2),'%',
+                         ' (', round(ret_goog_year*100,2),'%', ' per year)\n',
+                         'Total real return, adjusted for inflation, equals to ',
+                         round(real_ret_goog*100,2),'%', 
+                         ' (', round(real_ret_goog_year*100,2),'%', ' per year)'),
+       x = '',
+       y = paste(series_name ,'Value'),
+       caption = 'Data from Yahoo Finance') + 
+  theme_bw(base_family = "TT Times New Roman") 
+
+# calculate largest absolute price variations
+n_largest <- 10 # number of largest absolute returns to plot
+largest_tab <- df_prices %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::top_n(abs(log_ret), n = n_largest)
+
+# create second plot
+p2 <- ggplot(df_prices, 
+             aes(x = ref.date, y = log_ret)) + 
+  geom_line() + 
+  labs(title = paste0('Nominal Daily Log Returns of ', series_name),
+       subtitle = paste0('Red circles represent the largest ', n_largest, 
+                         ' absolute price variations in the sample'),
+       x = '',
+       y = 'Log Returns',
+       caption = 'Data from Yahoo Finance') + 
+  theme_bw(base_family = "TT Times New Roman") +
+  geom_point(data = largest_tab, aes(x = ref.date, y = log_ret), 
+             size = 3, color = 'red'  ) +
+  scale_y_continuous(labels = scales::percent) + 
+  labs(size = 'Absolute Price Variation') # + 
+  scale_color_brewer(palette = 'BrBG')
+
+# bind plots together
+p <- plot_grid(p1, p2, nrow = 2, 
+               labels = 'AUTO')
+
+p
+```
+
+# Testing for ARCH effects
+```{r}
+
+
+
+##### A function of arch effect test
+do_arch_test <- function(x, max_lag = 5) {
+  require(FinTS)
+  require(tidyverse)
+  
+  do_single_arch <- function(x, used_lag)  {
+    test_out <- FinTS::ArchTest(x, lags = used_lag)
+    
+    res_out <- tibble(Lag = used_lag,
+                      `LMStatistic` = test_out$statistic, 
+                      `pvalue` = test_out$p.value)
+  }
+  
+  tab_out <- bind_rows(map(1:max_lag,.f = do_single_arch, x = x))
+  
+  return(tab_out)
+}
+
+################################
+max_lag <- 5
+
+#  arch test
+tab_out <- do_arch_test(x = df_prices$log_ret, max_lag = max_lag)
+
+tab_out
+
+acf_p <- ggAcf(x = df_prices$log_ret, lag.max = 10) +
+  labs(title = paste0('Autocorrelogram for the Log Returns of ', series_name)) +
+  theme_bw(base_family = "TT Times New Roman")
+acf_p
+```
+
+
+# Finding the best GARCH specification
+
+```{r}
+
+## MAIN OPTIONS
+
+max_lag_AR <- 1 #maximum try of the AR lag
+max_lag_MA <- 1 #maximum try of the MA lag
+max_lag_ARCH <- 2 #maximum try of the ARCH lag
+max_lag_GARCH <- 1 #maximum try of the GARCH lag
+dist_to_use <- c('norm', 'std') # set distribution in normal and student
+models_to_estimate <- c('sGARCH', 'eGARCH', 'gjrGARCH') 
+
+#### Set up a function to find the best model
+do_single_garch <- function(x, 
+                            type_model, 
+                            type_dist, 
+                            lag_ar, 
+                            lag_ma, 
+                            lag_arch, 
+                            lag_garch) {
+  require(rugarch)
+  
+  
+  spec = ugarchspec(variance.model = list(model =  type_model, 
+                                          garchOrder = c(lag_arch, lag_garch)),
+                    mean.model = list(armaOrder = c(lag_ar, lag_ma)),
+                    distribution = type_dist)
+  
+  message('Estimating ARMA(',lag_ar, ',', lag_ma,')-',
+          type_model, '(', lag_arch, ',', lag_garch, ')', 
+          ' dist = ', type_dist,
+          appendLF = FALSE)
+  
+  try({
+    my_rugarch <- list()
+    my_rugarch <- ugarchfit(spec = spec, data = x)
+  })
+  
+  if (!is.null(coef(my_rugarch))) {
+    message('\tDone')
+    
+    AIC <- rugarch::infocriteria(my_rugarch)[1]
+    BIC <- rugarch::infocriteria(my_rugarch)[2]
+  } else {
+    message('\tEstimation failed..')
+    
+    AIC <- NA
+    BIC <- NA
+  }
+
+  est_tab <- tibble(lag_ar, 
+                    lag_ma,
+                    lag_arch,
+                    lag_garch,
+                    AIC =  AIC,
+                    BIC = BIC,
+                    type_model = type_model,
+                    type_dist,
+                    model_name = paste0('ARMA(', lag_ar, ',', lag_ma, ')+',
+                                        type_model, '(', lag_arch, ',', lag_garch, ') ',
+                                        type_dist) ) 
+  
+  return(est_tab)
+}
+find_best_arch_model <- function(x, 
+                                 type_models, 
+                                 dist_to_use,
+                                 max_lag_AR,
+                                 max_lag_MA,
+                                 max_lag_ARCH,
+                                 max_lag_GARCH) {
+  
+  require(tidyr)
+  
+  df_grid <- expand_grid(type_models = type_models,
+                         dist_to_use = dist_to_use,
+                         arma_lag = 0:max_lag_AR,
+                         ma_lag = 0:max_lag_MA,
+                         arch_lag = 1:max_lag_ARCH,
+                         garch_lag = 1:max_lag_GARCH)
+  
+  
+  l_out <- pmap(.l = list(x = rep(list(x), nrow(df_grid)), 
+                          type_model = df_grid$type_models,
+                          type_dist = df_grid$dist_to_use,
+                          lag_ar = df_grid$arma_lag,
+                          lag_ma = df_grid$ma_lag,
+                          lag_arch = df_grid$arch_lag,
+                          lag_garch  = df_grid$garch_lag),
+                do_single_garch)
+  
+  tab_out <- bind_rows(l_out)
+  
+  # find by AIC
+  idx <- which.min(tab_out$AIC)
+  best_aic <- tab_out[idx, ]
+  
+  # find by BIC
+  idx <- which.min(tab_out$BIC)
+  best_bic <- tab_out[idx, ]
+  
+  l_out <- list(best_aic = best_aic,
+                best_bic = best_bic,
+                tab_out = tab_out)
+  
+  return(l_out)
+}
+
+#############################
+
+out <- find_best_arch_model(x = df_prices$log_ret, 
+                            type_models = models_to_estimate,
+                            dist_to_use = dist_to_use,
+                            max_lag_AR = max_lag_AR,
+                            max_lag_MA = max_lag_MA,
+                            max_lag_ARCH = max_lag_ARCH,
+                            max_lag_GARCH = max_lag_GARCH)
+
+# get table with estimation results
+tab_out <- out$tab_out
+
+# pivot table to long format (better for plotting)
+df_long <- tidyr::pivot_longer(data = tab_out %>%
+                                 dplyr::select(model_name,
+                                        type_model,
+                                        type_dist,
+                                        AIC, BIC),  cols = c('AIC', 'BIC'))
+
+models_names <- unique(df_long$model_name)
+best_models <- c(tab_out$model_name[which.min(tab_out$AIC)],
+                 tab_out$model_name[which.min(tab_out$BIC)])
+
+# figure out where is the best model
+df_long <- df_long %>%
+  mutate(order_model = if_else(model_name %in% best_models, 'Best Model', 'Not Best Model') ) %>%
+  na.omit()
+
+# make table with best models
+df_best_models <- df_long %>%
+  group_by(name) %>%
+  summarise(model_name = model_name[which.min(value)],
+            value = value[which.min(value)],
+            type_model = type_model[which.min(value)])
+
+# plot results
+model_plot <- ggplot(df_long %>%
+               arrange(type_model), 
+             aes(x = reorder(model_name, 
+                             order(type_model)),
+                 y = value, 
+                 shape = type_dist,
+                 color = type_model)) + 
+  geom_point(size = 3.5, alpha = 0.65) + 
+  coord_flip() + 
+  theme_bw(base_family = "TT Times New Roman") + 
+  facet_wrap(~name, scales = 'free_x') + 
+  geom_point(data = df_best_models, mapping = aes(x = reorder(model_name, 
+                                                              order(type_model)),
+                                                  y = value), 
+             color = 'blue', size = 5, shape = 8) +
+  labs(title = 'Selecting Garch Models by Fitness Criteria', 
+       subtitle = 'The best model is the one with lowest AIC or BIC (with star)',
+       x = '',
+       y = 'Value of Fitness Criteria',
+       shape = 'Type of Dist.',
+       color = 'Type of Model') + 
+  theme(legend.position = "right")
+
+#x11()  ; p1 ; ggsave('figs/fig04_best_garch.png')
+
+
+# estimate best garch model by BIC 
+best_spec = ugarchspec(variance.model = list(model =  out$best_bic$type_model, 
+                                             garchOrder = c(out$best_bic$lag_arch,
+                                                            out$best_bic$lag_garch)),
+                       mean.model = list(armaOrder = c(out$best_bic$lag_ar, 
+                                                       out$best_bic$lag_ma)),
+                       distribution = 'std')
+
+my_best_garch <- ugarchfit(spec = best_spec, 
+                           data = df_prices$log_ret)
+
+
+```
+
+# How the volitility affect return?
+
+```{r}
+
+
+my_best_garch@model[["modeldata"]][["index"]] = df_prices$ref.date # reset the index column by given time-frame since there some errors
+
+plot(my_best_garch)
+x <- c(1:12)
+plot(my_best_garch) #please enter 1:12 to plot 
+#my_best_garch
+```
+# Simulation 
+
+
+
+```{R}
+set.seed(123) 
+n_sim <- 5000 # number of simulations 
+n_days_ahead <- 15*365 # number of the day of ahead to predict
+
+ do_sim <- function(n_sim = 1000, n_t = 1000, my_garch, df_prices) {
+  require(tidyverse)
+  require(rugarch)
+
+   
+############ A function for simulation#########  
+  do_single_sim <- function(i_sim, n_t, my_garch, df_prices) {
+    
+    
+    message('Simulation ', i_sim)
+    
+    rugarch_sim = ugarchsim(my_garch, n.sim = n_t, 
+                            m.sim = 1)
+    
+    sim_series <- rugarch_sim@simulation$seriesSim
+    
+    df_sim_out <- tibble(i_sim = i_sim, 
+                         i_t = 0:length(sim_series),
+                         ref_date = last(df_prices$ref.date) + i_t,
+                         sim_log_ret = c(0, sim_series), # model was estimated on log returns
+                         sim_arit_ret = exp(sim_log_ret)-1, # use arit return for price calculation
+                         sim_price = last(df_prices$price.adjusted)*(cumprod(1+sim_arit_ret)) )
+    
+    return(df_sim_out) 
+  }
+#########################  
+  df_out <- bind_rows(map(.x = 1:n_sim, 
+                          .f = do_single_sim, 
+                          my_garch = my_garch, 
+                          n_t = n_t,
+                          df_prices=df_prices))
+  
+  
+}
+df_sim <- do_sim(n_sim = n_sim, 
+                 n_t = n_days_ahead, 
+                 my_best_garch, 
+                 df_prices = df_prices)
+
+glimpse(df_sim )
+
+# calculate probabilities of reaching peak value
+tab_prob <- df_sim %>%
+  group_by(ref_date) %>%
+  summarise(prob = mean(sim_price > max(df_prices$price.adjusted)))
+
+n_years_back <- 4
+df_prices_temp <- df_prices %>%
+  dplyr::filter(ref.date > max(ref.date) - n_years_back*365)
+
+my_garch_name <- toupper(as.character(my_best_garch@model$modeldesc$vmodel))
+
+p1 <- ggplot() + 
+  geom_line(data = df_prices_temp, 
+            aes(x = ref.date, y = price.adjusted), color = 'black', size = 0.75)  + 
+  geom_line(data = df_sim, 
+            aes(x = ref_date, 
+                y = sim_price, 
+                group = i_sim),
+            color = 'grey', 
+            size = 0.25,
+            alpha = 0.015) + 
+  theme_bw(base_family = "TT Times New Roman") + 
+  geom_hline(yintercept = max(df_prices_temp$price.adjusted)) + 
+  labs(title = paste0('Price Projections of ', series_name),
+       subtitle = paste0('Total of ', n_sim, ' simulations based on a ',
+                         my_garch_name, 
+                         ' model selected by BIC'),
+       caption = 'Data from Yahoo Finance',
+       x = '',
+       y = 'Value') + 
+  ylim(c(0.75*min(df_prices_temp$price.adjusted), 
+         1.25*max(df_prices_temp$price.adjusted))) + 
+  xlim(c(max(df_prices_temp$ref.date) - n_years_back*365,
+         max(df_prices_temp$ref.date) + 2*365) )
+
+
+my_idx_date <- first(which(tab_prob$prob > 0.5))
+df_date <- tibble(idx = c(first(which(tab_prob$prob > 0.001)),
+                          first(which(tab_prob$prob > 0.5)),
+                          first(which(tab_prob$prob > 0.75)),
+                          first(which(tab_prob$prob > 0.95))),
+                  ref_date = tab_prob$ref_date[idx],
+                  prob = tab_prob$prob[idx],
+                  my_text = paste0(format(ref_date, '%m/%d/%Y'),
+                                   '\nprob = ', scales::percent(prob) ) )
+
+df_textbox <- tibble(ref_date = df_date$ref_date[2],
+                     prob = 0.25,
+                     label = paste0('According to the estimated _', my_garch_name, '_ model, ', 
+                                    'the chances of asset **', series_name, '** to reach ',
+                                    'its historical peak value of ', 
+                                    format(max(df_prices$price.adjusted), 
+                                           big.mark = ',',
+                                           decimal.mark = '.'),
+                                    ' are higher than 50% at ', format(ref_date, '%m/%d/%Y'), '.') )
+
+
+
+p2 <- ggplot(tab_prob, aes(x = ref_date, y = prob) ) + 
+  geom_line(size = 2) + 
+  labs(title = paste0('Probabilities of ', series_name, ' Reaching its Historical Peak'),
+       subtitle = paste0('Calculations based on simulations of ',
+                         my_garch_name, 
+                         ' model'),
+       x = '',
+       y = 'Probability') + 
+  scale_y_continuous(labels = scales::percent) + 
+  geom_point(data = df_date,
+             aes(x = ref_date, y = prob), size = 5, color = 'red') + 
+  geom_text(data = df_date, aes(x = ref_date, y = prob, 
+                                label = my_text), 
+            nudge_x = nrow(tab_prob)*0.085,
+            nudge_y = -0.05,
+            color ='red', check_overlap = TRUE) + 
+  geom_textbox(data = df_textbox, 
+               mapping = aes(x = ref_date, 
+                             y = prob, 
+                             label = label),
+               width = unit(0.5, "npc"),
+               #fill = "cornsilk",
+               hjust = 0) + 
+  theme_bw(base_family = "TT Times New Roman")
+p1
+p2
+```
+
+
